@@ -1,4 +1,4 @@
-# sso-practice
+# oauth2-sso-demo
 
 OAuth2 Authorization Code Flow SSO 實作練習，本機以 Keycloak 模擬正式授權伺服器的完整流程。
 
@@ -24,8 +24,33 @@ Go Backend / Gin (localhost:8081)
               +--- Realm: demo
                       |
                       +--- Client: demo
-                      +--- Users: testuser
+                      +--- Roles: admin
+                      +--- Users: testuser, testadmin
 ```
+
+---
+
+## Screenshots
+
+### 前端
+
+| 登入頁 | Keycloak 登入頁 |
+|--------|----------------|
+| ![登入頁](docs/screenshots/01_login.png) | ![Keycloak 登入](docs/screenshots/02_keycloak_login.png) |
+
+| Dashboard（一般用戶） | Dashboard（Admin） |
+|----------------------|-------------------|
+| ![一般用戶](docs/screenshots/03_dashboard_user.png) | ![Admin](docs/screenshots/04_dashboard_admin.png) |
+
+### Keycloak 設定
+
+| Realm 設定 | Client 設定（Redirect URIs） |
+|-----------|---------------------------|
+| ![Realm](docs/screenshots/05_kc_realm.png) | ![Client](docs/screenshots/06_kc_client.png) |
+
+| User 列表 | Role 列表 | testadmin Role Mapping |
+|----------|----------|----------------------|
+| ![Users](docs/screenshots/07_kc_users.png) | ![Roles](docs/screenshots/08_kc_roles.png) | ![Role Mapping](docs/screenshots/09_kc_role_mapping.png) |
 
 ---
 
@@ -46,15 +71,21 @@ Go Backend / Gin (localhost:8081)
 ## 專案結構
 
 ```
-sso-practice/
+oauth2-sso-demo/
 ├── docker-compose.yml
+├── docs/
+│   └── screenshots/
 ├── backend/
 │   ├── main.go
 │   ├── .env
 │   ├── config/
 │   │   └── config.go        讀取環境變數
 │   ├── handler/
-│   │   └── auth.go          /login /callback /logout /me
+│   │   └── auth.go          /login /callback /logout /me /admin/data
+│   ├── middleware/
+│   │   └── auth.go          TokenRefresh、RequireRole
+│   ├── jwks/
+│   │   └── jwks.go          從 Keycloak 取公鑰並快取，用於 JWT 驗簽
 │   └── store/
 │       └── session.go       Redis session 存取
 └── frontend/
@@ -109,8 +140,11 @@ docker compose ps   # 確認兩個都是 healthy
   Post logout redirect URIs: http://localhost:5173/
   Web origins: http://localhost:5173
 
+建立 Role：admin（Realm roles → Create role）
+
 建立 User：
-  Username: testuser
+  testuser   → 不指派任何 role
+  testadmin  → Role mapping 指派 admin role
   Credentials → Set password（Temporary: OFF）
 ```
 
@@ -150,12 +184,13 @@ npm run dev
 
 ## API
 
-| Method | 路徑 | 說明 |
-|--------|------|------|
-| `GET` | `/api/auth/login` | 產生 state，redirect 到 Keycloak 登入頁 |
-| `GET` | `/api/auth/callback` | 接收 code，換 token，建立 session，redirect 前端 |
-| `GET` | `/api/auth/logout` | 清除 session，redirect Keycloak 全域登出 |
-| `GET` | `/api/auth/me` | 回傳目前登入的使用者資訊 |
+| Method | 路徑 | 說明 | 保護 |
+|--------|------|------|------|
+| `GET` | `/api/auth/login` | 產生 state，redirect 到 Keycloak 登入頁 | — |
+| `GET` | `/api/auth/callback` | 接收 code，換 token，建立 session，redirect 前端 | — |
+| `GET` | `/api/auth/logout` | 清除 session，redirect Keycloak 全域登出 | — |
+| `GET` | `/api/auth/me` | 回傳目前登入的使用者資訊 | session |
+| `GET` | `/api/admin/data` | 管理員專屬資料 | session + admin role |
 
 **`/api/auth/me` 回傳範例**
 
@@ -165,7 +200,7 @@ npm run dev
   "name": "Test User",
   "username": "testuser",
   "email": "test@demo.com",
-  "roles": ["default-roles-demo"]
+  "roles": ["offline_access", "admin", "default-roles-demo", "uma_authorization"]
 }
 ```
 
@@ -180,6 +215,20 @@ Keycloak 登入完後，code 直接送到 Go 後端（`/api/auth/callback`），
 **State 的作用**
 
 `/api/auth/login` 產生隨機 state 存進 Redis，callback 回來時驗證是否一致。防止 CSRF 攻擊：確保這個 callback 是由你的 login 發起的，不是別人偽造的。
+
+**id_token 和 access_token 的分工**
+
+兩個 token 都是 JWT，但用途不同：
+- `id_token`：帶使用者身份資訊（name、email、sub），供後端識別「你是誰」
+- `access_token`：帶授權資訊（`realm_access.roles`），供後端判斷「你能做什麼」
+
+**JWT 簽章驗證（JWKS）**
+
+後端收到 id_token 後，從 Keycloak 的 `/certs` 端點取得 RSA 公鑰，驗證 JWT 簽章是否合法。公鑰快取 1 小時，避免每次都打 Keycloak。
+
+**Token Refresh（靜默換新）**
+
+每個 request 進來時，後端 middleware 檢查 access_token 是否快過期（剩不到 60 秒）。快過期就用 refresh_token 向 Keycloak 換新 token 並更新 Redis，使用者完全感知不到。
 
 **Session 為什麼存 Redis 不存記憶體？**
 
@@ -213,17 +262,18 @@ Docker healthcheck 的 `CMD-SHELL` 預設走 `/bin/sh`，但 `/dev/tcp` 是 bash
 
 原本 `REDIRECT_URI` 設成前端的 `localhost:5173/callback`，導致 Keycloak 把 code 送到前端，但前端沒跑起來就拒絕連線。改成直接指向後端 `localhost:8081/api/auth/callback`，由後端接收 code 並處理。
 
----
+**6. roles 在 access_token，不在 id_token**
 
-## 日後擴充方向
+`realm_access.roles` 只存在 access_token，id_token 不帶 roles。一開始只解析 id_token 導致 roles 永遠是空的，需要另外 parse access_token 來取 roles。
 
-- [ ] Token Refresh：access_token 5 分鐘過期，用 refresh_token 自動換新
-- [ ] JWT 簽章驗證：從 Keycloak `/certs` 拿公鑰驗證 id_token 合法性
-- [ ] Role-based 權限：依 `realm_access.roles` 控制 API 和前端頁面存取
-- [ ] Client Credentials Flow：背景排程或 server-to-server 呼叫用
+**7. Role 比對要 case-insensitive**
+
+Keycloak role 名稱是 `admin`（小寫），但程式碼寫的是 `"Admin"`，導致前端判斷顯示異常、後端 API 永遠 403。前端用 `.toLowerCase()` 比對，後端改用 `strings.EqualFold()` 解決。
 
 ---
 
 ## 關於這個專案
 
 為了理解 OAuth2 Authorization Code Flow 實際運作而建的練習專案。本機以 Keycloak 模擬正式環境的授權伺服器，換掉 `.env` 的 URL 即可對接正式環境。
+
+開發過程以 [Claude Code](https://claude.ai/code) 輔助。

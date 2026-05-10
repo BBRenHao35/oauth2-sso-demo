@@ -2,16 +2,20 @@ package handler
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"oauth2-sso-demo/config"
+	"oauth2-sso-demo/jwks"
 	"oauth2-sso-demo/store"
 )
 
@@ -82,12 +86,15 @@ func Callback(c *gin.Context) {
 		return
 	}
 
-	// 解析 id_token 取得使用者資訊
+	// 解析 id_token 取得使用者基本資訊（name, email 等）
 	user, err := parseIDToken(tokenResp.IDToken)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse id_token"})
 		return
 	}
+
+	// roles 在 access_token 裡，補充進來
+	user.Roles = parseRoles(tokenResp.AccessToken)
 
 	// 把完整 session 存回 Redis（覆蓋原本只有 state 的那筆）
 	if err := store.Store.Set(sid, &store.Session{
@@ -185,27 +192,44 @@ func exchangeCodeForToken(code string) (*tokenResponse, error) {
 	return &result, nil
 }
 
+// parseIDToken 解析並驗證 JWT 簽章，確認 token 是真的由 Keycloak 簽發
 func parseIDToken(idToken string) (store.UserInfo, error) {
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
 		return store.UserInfo{}, fmt.Errorf("invalid JWT format")
 	}
 
-	payload := parts[1]
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-
-	decoded, err := base64.URLEncoding.DecodeString(payload)
+	// 1. 從 header 取出 kid（Key ID），用來找對應的公鑰
+	headerJSON, err := base64.URLEncoding.DecodeString(padBase64(parts[0]))
 	if err != nil {
+		return store.UserInfo{}, fmt.Errorf("invalid header: %w", err)
+	}
+	var header struct {
+		Kid string `json:"kid"`
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
 		return store.UserInfo{}, err
 	}
 
+	// 2. 用 kid 從 Keycloak 拿對應的 RSA 公鑰
+	pubKey, err := jwks.GetKey(header.Kid)
+	if err != nil {
+		return store.UserInfo{}, fmt.Errorf("cannot get public key: %w", err)
+	}
+
+	// 3. 驗證簽章（header.payload 的 SHA256 hash 用公鑰解密後應與 signature 一致）
+	if err := verifyRSA(parts[0]+"."+parts[1], parts[2], pubKey); err != nil {
+		return store.UserInfo{}, fmt.Errorf("invalid signature: %w", err)
+	}
+
+	// 4. 簽章正確，解析 payload 取使用者資訊
+	payloadJSON, err := base64.URLEncoding.DecodeString(padBase64(parts[1]))
+	if err != nil {
+		return store.UserInfo{}, err
+	}
 	var raw map[string]interface{}
-	if err := json.Unmarshal(decoded, &raw); err != nil {
+	if err := json.Unmarshal(payloadJSON, &raw); err != nil {
 		return store.UserInfo{}, err
 	}
 
@@ -229,9 +253,86 @@ func parseIDToken(idToken string) (store.UserInfo, error) {
 	return user, nil
 }
 
+// AdminData 示範 role-based 保護的 API，只有 Admin / Advanced 能存取
+func AdminData(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"message": "管理員專屬資料",
+		"data":    []string{"user-list", "system-config", "audit-log"},
+	})
+}
+
+// ── 內部工具 ──────────────────────────────────────────────────────────────────
+
+func verifyRSA(signingInput, signatureB64 string, pub *rsa.PublicKey) error {
+	sig, err := base64.URLEncoding.DecodeString(padBase64(signatureB64))
+	if err != nil {
+		return err
+	}
+	h := sha256.Sum256([]byte(signingInput))
+	// RSA PKCS1v15 驗簽
+	e := big.NewInt(int64(pub.E))
+	n := pub.N
+	sigInt := new(big.Int).SetBytes(sig)
+	decrypted := new(big.Int).Exp(sigInt, e, n).Bytes()
+
+	// PKCS1v15 padding：最後 32 bytes 是 SHA256 hash
+	if len(decrypted) < 32 {
+		return fmt.Errorf("signature verification failed")
+	}
+	actual := decrypted[len(decrypted)-32:]
+	for i := range h {
+		if h[i] != actual[i] {
+			return fmt.Errorf("signature mismatch")
+		}
+	}
+	return nil
+}
+
+func padBase64(s string) string {
+	switch len(s) % 4 {
+	case 2:
+		return s + "=="
+	case 3:
+		return s + "="
+	}
+	return s
+}
+
 func getString(m map[string]interface{}, key string) string {
 	if v, ok := m[key].(string); ok {
 		return v
 	}
 	return ""
+}
+
+// parseRoles 從 access_token 取出 realm_access.roles
+// roles 在 access_token 裡，不在 id_token 裡
+func parseRoles(accessToken string) []string {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	decoded, err := base64.URLEncoding.DecodeString(padBase64(parts[1]))
+	if err != nil {
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(decoded, &raw); err != nil {
+		return nil
+	}
+	ra, ok := raw["realm_access"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	rolesRaw, ok := ra["roles"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var roles []string
+	for _, r := range rolesRaw {
+		if s, ok := r.(string); ok {
+			roles = append(roles, s)
+		}
+	}
+	return roles
 }
