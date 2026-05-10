@@ -81,8 +81,8 @@ sequenceDiagram
 
         B->>K: GET /auth?response_type=code&state=xxx&redirect_uri=...
         Note over B,K: 使用者在 Keycloak 頁面輸入帳密
-        K-->>B: 302 /api/auth/callback?code=XXXX&state=xxx
-
+        K-->>B: 302 → /api/auth/callback?code=XXXX&state=xxx
+        Note over B: Keycloak 無法直接呼叫後端<br/>只能透過 302 叫瀏覽器去跳<br/>瀏覽器自動發出下一個 request
         B->>G: GET /api/auth/callback?code=XXXX&state=xxx
         G->>R: GET session:{sid}
         R-->>G: {state: xxx}
