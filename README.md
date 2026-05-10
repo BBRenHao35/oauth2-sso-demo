@@ -356,11 +356,16 @@ docker compose ps   # 確認兩個都是 healthy
 
 ### 3. 設定 backend/.env
 
-複製 Keycloak `Clients → demo → Credentials → Client secret` 填入：
+建立 `backend/.env`，將 Keycloak `Clients → demo → Credentials → Client secret` 填入 `CLIENT_SECRET`：
 
-```bash
-cp backend/.env.example backend/.env   # 若有 example 的話
-# 填入 CLIENT_SECRET
+```env
+KEYCLOAK_BASE=http://localhost:8080/realms/demo/protocol/openid-connect
+CLIENT_ID=demo
+CLIENT_SECRET=（從 Keycloak Credentials 分頁複製）
+REDIRECT_URI=http://localhost:8081/api/auth/callback
+POST_LOGOUT_URI=http://localhost:5173/
+FRONTEND_URL=http://localhost:5173
+REDIS_URL=redis://localhost:6379
 ```
 
 ---
@@ -458,24 +463,6 @@ npm run dev
 ---
 
 ## 核心概念
-
-**為什麼 callback 直接打後端，不經過前端？**
-
-Keycloak 登入完後，code 直接送到 Go 後端（`/api/auth/callback`），後端換完 token 才把瀏覽器導到前端。這樣 `client_secret` 完全不會暴露給瀏覽器，前端也不需要處理 OAuth 邏輯。
-
-**State 的作用**
-
-`/api/auth/login` 產生隨機 state 存進 Redis，callback 回來時驗證是否一致。防止 CSRF 攻擊：確保這個 callback 是由本系統的 login 發起的，不是別人偽造的。
-
-**id_token 和 access_token 的分工**
-
-兩個 token 都是 JWT，但用途不同：
-- `id_token`：帶使用者身份資訊（name、email、sub），供後端識別「這個使用者是誰」
-- `access_token`：帶授權資訊（`realm_access.roles`），供後端判斷「這個使用者能做什麼」
-
-**JWT 簽章驗證（JWKS）**
-
-後端收到 id_token 後，從 Keycloak 的 `/certs` 端點取得 RSA 公鑰，驗證 JWT 簽章是否合法。公鑰快取 1 小時，避免每次都打 Keycloak。
 
 **Token Refresh（靜默換新）**
 
