@@ -113,6 +113,7 @@ sequenceDiagram
 這支 API 本身不顯示任何東西，做完就把瀏覽器導走，使用者感覺不到它的存在。
 
 後端做兩件事：
+
 1. 產生隨機 `state` 和 `session_id`，把 state 存進 Redis（TTL 10 分鐘）
 2. 把 Keycloak 的登入 URL 組出來，帶著 session_id cookie 把瀏覽器 302 導過去
 
