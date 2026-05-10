@@ -1,0 +1,19 @@
+# Env
+**/.env
+**/.env.local
+
+# Go build output
+backend/sso-practice
+backend/*.exe
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
