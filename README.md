@@ -30,6 +30,148 @@ Go Backend / Gin (localhost:8081)
 
 ---
 
+## 登入流程
+
+### 整體 Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant B as 使用者（瀏覽器）
+    participant G as Go 後端（Gin）
+    participant K as Keycloak
+    participant R as Redis
+
+    B->>G: GET /api/auth/login
+    G->>R: SET session:{sid} {state}  TTL 10min
+    G-->>B: 302 + Set-Cookie: session_id
+
+    B->>K: GET /auth?response_type=code&state=xxx&redirect_uri=...
+    Note over B,K: 使用者在 Keycloak 頁面輸入帳密
+    K-->>B: 302 /api/auth/callback?code=XXXX&state=xxx
+
+    B->>G: GET /api/auth/callback?code=XXXX&state=xxx
+    G->>R: GET session:{sid}
+    R-->>G: {state: xxx}
+    Note over G: 驗證 state 一致 ✓
+
+    G->>K: POST /token (code + client_secret)
+    K-->>G: {access_token, refresh_token, id_token}
+
+    G->>K: GET /certs（JWKS）
+    K-->>G: RSA 公鑰
+    Note over G: 驗證 id_token 簽章<br/>解析 name / email / sub<br/>解析 roles（from access_token）
+
+    G->>R: SET session:{sid} {tokens + user}  TTL 30min
+    G-->>B: 302 → /dashboard
+
+    B->>G: GET /api/auth/me
+    G->>R: GET session:{sid}
+    R-->>G: {user info}
+    G-->>B: {name, email, roles}
+```
+
+---
+
+### 段落一：觸發登入 — 產生 state，導向 Keycloak
+
+使用者點擊「SSO 登入」，前端將瀏覽器整頁跳轉至後端 `/api/auth/login`。
+
+後端做兩件事：
+
+1. 產生隨機 `state`（防 CSRF）與 `session_id`，將 `{state}` 存入 Redis（TTL 10 分鐘）
+2. 組合 Keycloak 授權 URL，帶著 `session_id` cookie 302 導向使用者
+
+```
+GET http://localhost:8080/realms/demo/protocol/openid-connect/auth
+  ?response_type=code
+  &client_id=demo
+  &scope=openid
+  &state={{RANDOM_STATE}}
+  &redirect_uri=http://localhost:8081/api/auth/callback
+```
+
+| 參數 | 說明 |
+|------|------|
+| `response_type=code` | 指定使用 Authorization Code Flow |
+| `state` | 後端自產的隨機字串，callback 時驗證用，防止 CSRF |
+| `redirect_uri` | 登入完成後 Keycloak 要跳回的地址，**指向後端** |
+
+---
+
+### 段落二：Keycloak 驗證帳密，回傳 Code
+
+瀏覽器被導向 Keycloak 登入頁，使用者輸入帳密。  
+Keycloak 驗證成功後，產生一次性 `code`，將瀏覽器 302 導回：
+
+```
+GET http://localhost:8081/api/auth/callback
+  ?code=XXXX
+  &state=剛才的隨機字串
+```
+
+> `code` 只能使用一次，且有短暫時效（通常數分鐘內需換成 token）。
+
+---
+
+### 段落三：State 驗證 + Code 換 Token
+
+後端收到 callback，從 cookie 取出 `session_id`，去 Redis 讀出當初存的 `state` 進行比對。  
+驗證通過後，**在後端**向 Keycloak 換取 token（`client_secret` 不暴露給瀏覽器）：
+
+```
+POST http://localhost:8080/realms/demo/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&client_id=demo
+&client_secret={{CLIENT_SECRET}}
+&redirect_uri=http://localhost:8081/api/auth/callback
+&code=XXXX
+```
+
+Keycloak 回傳：
+
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "id_token": "eyJ...",
+  "expires_in": 300
+}
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `id_token` | 使用者身份資訊（name、email、sub），JWT 格式 |
+| `access_token` | 授權資訊（`realm_access.roles`），JWT 格式 |
+| `refresh_token` | 用於在 access_token 過期前靜默換新 |
+
+---
+
+### 段落四：驗簽 + 解析使用者資訊
+
+後端從 Keycloak `/certs` 取得 RSA 公鑰（JWKS），驗證 `id_token` 的 JWT 簽章合法性，  
+確認 token 確實由 Keycloak 簽發、未被竄改，才繼續解析：
+
+```
+id_token  payload → sub / name / email（使用者身份）
+access_token payload → realm_access.roles（使用者角色）
+```
+
+> `roles` 在 `access_token` 裡，不在 `id_token` 裡，需分開解析。
+
+---
+
+### 段落五：建立 Session，導回前端
+
+後端將完整 session（tokens + user info）存入 Redis（TTL 30 分鐘），  
+再把瀏覽器 302 導向前端 `/dashboard`。
+
+前端載入後呼叫 `/api/auth/me`，後端從 Redis 讀出 session 回傳使用者資訊，  
+前端依 `roles` 判斷是否顯示管理員區塊。
+
+---
+
 ## Screenshots
 
 ### 前端
