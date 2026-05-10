@@ -60,7 +60,7 @@ graph LR
     F -->|顯示 Dashboard| U
 ```
 
-> 實務上，你負責開發方（Frontend + Backend），客戶只需提供 Keycloak Server 的 URL 與憑證（Client ID / Secret）。換掉 `.env` 即可對接正式環境。
+> 實務上，開發方負責 Frontend + Backend，客戶只需提供 Keycloak Server 的 URL 與憑證（Client ID / Secret）。換掉 `.env` 即可對接正式環境。
 
 ---
 
@@ -109,7 +109,7 @@ sequenceDiagram
 
 ### 段落一：觸發登入 — 產生 state，導向 Keycloak
 
-使用者點「SSO 登入」後，瀏覽器打你的後端 `GET /api/auth/login`。  
+使用者點「SSO 登入」後，瀏覽器打後端 `GET /api/auth/login`。  
 這支 API 本身不顯示任何東西，做完就把瀏覽器導走，使用者感覺不到它的存在。
 
 後端做兩件事：
@@ -129,8 +129,8 @@ GET http://localhost:8080/realms/demo/protocol/openid-connect/auth
 
 | 參數 | 說明 |
 |------|------|
-| `state` | 後端自產的隨機字串，存在 Redis，callback 時用來確認這個請求是你發起的 |
-| `redirect_uri` | 登入完成後 Keycloak 要把瀏覽器導回哪裡，這裡指向你的後端 |
+| `state` | 後端自產的隨機字串，存在 Redis，callback 時用來確認這個請求是由本系統發起的 |
+| `redirect_uri` | 登入完成後 Keycloak 要把瀏覽器導回哪裡，這裡指向後端 |
 
 使用者看到的：畫面直接跳到 Keycloak 的登入頁面。
 
@@ -138,10 +138,10 @@ GET http://localhost:8080/realms/demo/protocol/openid-connect/auth
 
 ### 段落二：使用者在 Keycloak 登入，code 被帶回後端
 
-這個 Keycloak 登入頁是**客戶端的頁面**，不是你自己的 UI。  
+這個 Keycloak 登入頁是**客戶端的頁面**，不是開發方自己的 UI。  
 使用者在上面輸入帳號密碼，Keycloak 驗證成功後產生一次性的 `code`。
 
-Keycloak 沒辦法直接呼叫你的後端，只能透過 302 叫瀏覽器去跳。  
+Keycloak 沒辦法直接呼叫後端，只能透過 302 叫瀏覽器去跳。  
 瀏覽器收到 302 後自動打：
 
 ```
@@ -150,7 +150,7 @@ GET http://localhost:8081/api/auth/callback
   &state=剛才的隨機字串
 ```
 
-code 就這樣被瀏覽器帶回到你的後端，整個過程使用者不需要做任何事。
+code 就這樣被瀏覽器帶回到後端，整個過程使用者不需要做任何事。
 
 > `code` 只能用一次，且有短暫時效，必須馬上換成 token。
 
@@ -159,7 +159,7 @@ code 就這樣被瀏覽器帶回到你的後端，整個過程使用者不需要
 ### 段落三：比對 state，用 code 換 token
 
 後端收到 callback，從 cookie 拿 `session_id`，去 Redis 找對應的 state，  
-跟 URL 上帶回來的 state 比對，確認這個 callback 真的是你的 login 發起的。
+跟 URL 上帶回來的 state 比對，確認這個 callback 真的是由本系統的 login 發起的。
 
 比對 OK 後，後端去 call Keycloak 的 `/token` API：
 
@@ -174,7 +174,7 @@ grant_type=authorization_code
 &code=XXXX
 ```
 
-`client_secret` 是客戶事先給你的暗號，Keycloak 用它確認這個請求是合法的 client。  
+`client_secret` 是客戶事先提供的暗號，Keycloak 用它確認這個請求是合法的 client。  
 這整段都在後端執行，瀏覽器完全不知道，`client_secret` 不會暴露出去。
 
 Keycloak 確認後回傳：
@@ -205,9 +205,9 @@ eyJhbGc...   .   eyJzdWIi...   .   SflKxwR...
   header     .     payload     .    signature
 ```
 
-payload Base64 解碼後就是使用者資訊，但你不能直接信任它——任何人都可以自己偽造一個 JWT 塞假資料進去。
+payload Base64 解碼後就是使用者資訊，但不能直接信任它——任何人都可以自己偽造一個 JWT 塞假資料進去。
 
-所以你要去 call Keycloak 的 `/certs` API 拿 RSA 公鑰，  
+所以需要去 call Keycloak 的 `/certs` API 拿 RSA 公鑰，  
 用這把公鑰驗 JWT 第三段的 signature，確認這個 token 真的是 Keycloak 簽的、沒有被竄改。
 
 驗過之後才信任 payload，解析出：
@@ -465,13 +465,13 @@ Keycloak 登入完後，code 直接送到 Go 後端（`/api/auth/callback`），
 
 **State 的作用**
 
-`/api/auth/login` 產生隨機 state 存進 Redis，callback 回來時驗證是否一致。防止 CSRF 攻擊：確保這個 callback 是由你的 login 發起的，不是別人偽造的。
+`/api/auth/login` 產生隨機 state 存進 Redis，callback 回來時驗證是否一致。防止 CSRF 攻擊：確保這個 callback 是由本系統的 login 發起的，不是別人偽造的。
 
 **id_token 和 access_token 的分工**
 
 兩個 token 都是 JWT，但用途不同：
-- `id_token`：帶使用者身份資訊（name、email、sub），供後端識別「你是誰」
-- `access_token`：帶授權資訊（`realm_access.roles`），供後端判斷「你能做什麼」
+- `id_token`：帶使用者身份資訊（name、email、sub），供後端識別「這個使用者是誰」
+- `access_token`：帶授權資訊（`realm_access.roles`），供後端判斷「這個使用者能做什麼」
 
 **JWT 簽章驗證（JWKS）**
 
