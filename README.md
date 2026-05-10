@@ -73,33 +73,29 @@ sequenceDiagram
     participant K as Keycloak
     participant R as Redis
 
-    rect rgb(219, 234, 254)
-        Note over B,R: 第一段：瀏覽器參與，使用者看得到
-        B->>G: GET /api/auth/login
-        G->>R: SET session:{sid} {state}  TTL 10min
-        G-->>B: 302 + Set-Cookie: session_id
+    Note over B,R: 第一段：瀏覽器參與，使用者看得到
+    B->>G: GET /api/auth/login
+    G->>R: SET session:{sid} {state}  TTL 10min
+    G-->>B: 302 + Set-Cookie: session_id
 
-        B->>K: GET /auth?response_type=code&state=xxx&redirect_uri=...
-        Note over B,K: 使用者在 Keycloak 頁面輸入帳密
-        K-->>B: 302 → /api/auth/callback?code=XXXX&state=xxx
-        Note over B: Keycloak 無法直接呼叫後端<br/>只能透過 302 叫瀏覽器去跳<br/>瀏覽器自動發出下一個 request
-        B->>G: GET /api/auth/callback?code=XXXX&state=xxx
-        G->>R: GET session:{sid}
-        R-->>G: {state: xxx}
-        Note over G: 驗證 state 一致 ✓
-    end
+    B->>K: GET /auth?response_type=code&state=xxx&redirect_uri=...
+    Note over B,K: 使用者在 Keycloak 頁面輸入帳密
+    K-->>B: 302 → /api/auth/callback?code=XXXX&state=xxx
+    Note over B: Keycloak 無法直接呼叫後端<br/>只能透過 302 叫瀏覽器去跳<br/>瀏覽器自動發出下一個 request
+    B->>G: GET /api/auth/callback?code=XXXX&state=xxx
+    G->>R: GET session:{sid}
+    R-->>G: {state: xxx}
+    Note over G: 驗證 state 一致 ✓
 
-    rect rgb(220, 252, 231)
-        Note over B,R: 第二段：後端對 Keycloak，瀏覽器完全不知道
-        G->>K: POST /token (code + client_secret)
-        K-->>G: {access_token, refresh_token, id_token}
+    Note over B,R: 第二段：後端對 Keycloak，瀏覽器完全不知道
+    G->>K: POST /token (code + client_secret)
+    K-->>G: {access_token, refresh_token, id_token}
 
-        G->>K: GET /certs（JWKS）
-        K-->>G: RSA 公鑰
-        Note over G: 驗證 id_token 簽章<br/>解析 name / email / sub<br/>解析 roles（from access_token）
+    G->>K: GET /certs（JWKS）
+    K-->>G: RSA 公鑰
+    Note over G: 驗證 id_token 簽章<br/>解析 name / email / sub<br/>解析 roles（from access_token）
 
-        G->>R: SET session:{sid} {tokens + user}  TTL 30min
-    end
+    G->>R: SET session:{sid} {tokens + user}  TTL 30min
 
     G-->>B: 302 → /dashboard
 
