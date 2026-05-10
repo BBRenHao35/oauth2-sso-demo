@@ -109,12 +109,14 @@ sequenceDiagram
 
 ### 段落一：觸發登入 — 產生 state，導向 Keycloak
 
-使用者點擊「SSO 登入」，前端將瀏覽器整頁跳轉至後端 `/api/auth/login`。
+使用者點「SSO 登入」後，瀏覽器打你的後端 `GET /api/auth/login`。  
+這支 API 本身不顯示任何東西，做完就把瀏覽器導走，使用者感覺不到它的存在。
 
 後端做兩件事：
+1. 產生隨機 `state` 和 `session_id`，把 state 存進 Redis（TTL 10 分鐘）
+2. 把 Keycloak 的登入 URL 組出來，帶著 session_id cookie 把瀏覽器 302 導過去
 
-1. 產生隨機 `state`（防 CSRF）與 `session_id`，將 `{state}` 存入 Redis（TTL 10 分鐘）
-2. 組合 Keycloak 授權 URL，帶著 `session_id` cookie 302 導向使用者
+組出來的 URL 長這樣：
 
 ```
 GET http://localhost:8080/realms/demo/protocol/openid-connect/auth
@@ -127,16 +129,20 @@ GET http://localhost:8080/realms/demo/protocol/openid-connect/auth
 
 | 參數 | 說明 |
 |------|------|
-| `response_type=code` | 指定使用 Authorization Code Flow |
-| `state` | 後端自產的隨機字串，callback 時驗證用，防止 CSRF |
-| `redirect_uri` | 登入完成後 Keycloak 要跳回的地址，**指向後端** |
+| `state` | 後端自產的隨機字串，存在 Redis，callback 時用來確認這個請求是你發起的 |
+| `redirect_uri` | 登入完成後 Keycloak 要把瀏覽器導回哪裡，這裡指向你的後端 |
+
+使用者看到的：畫面直接跳到 Keycloak 的登入頁面。
 
 ---
 
-### 段落二：Keycloak 驗證帳密，回傳 Code
+### 段落二：使用者在 Keycloak 登入，code 被帶回後端
 
-瀏覽器被導向 Keycloak 登入頁，使用者輸入帳密。  
-Keycloak 驗證成功後，產生一次性 `code`，將瀏覽器 302 導回：
+這個 Keycloak 登入頁是**客戶端的頁面**，不是你自己的 UI。  
+使用者在上面輸入帳號密碼，Keycloak 驗證成功後產生一次性的 `code`。
+
+Keycloak 沒辦法直接呼叫你的後端，只能透過 302 叫瀏覽器去跳。  
+瀏覽器收到 302 後自動打：
 
 ```
 GET http://localhost:8081/api/auth/callback
@@ -144,14 +150,18 @@ GET http://localhost:8081/api/auth/callback
   &state=剛才的隨機字串
 ```
 
-> `code` 只能使用一次，且有短暫時效（通常數分鐘內需換成 token）。
+code 就這樣被瀏覽器帶回到你的後端，整個過程使用者不需要做任何事。
+
+> `code` 只能用一次，且有短暫時效，必須馬上換成 token。
 
 ---
 
-### 段落三：State 驗證 + Code 換 Token
+### 段落三：比對 state，用 code 換 token
 
-後端收到 callback，從 cookie 取出 `session_id`，去 Redis 讀出當初存的 `state` 進行比對。  
-驗證通過後，**在後端**向 Keycloak 換取 token（`client_secret` 不暴露給瀏覽器）：
+後端收到 callback，從 cookie 拿 `session_id`，去 Redis 找對應的 state，  
+跟 URL 上帶回來的 state 比對，確認這個 callback 真的是你的 login 發起的。
+
+比對 OK 後，後端去 call Keycloak 的 `/token` API：
 
 ```
 POST http://localhost:8080/realms/demo/protocol/openid-connect/token
@@ -164,7 +174,10 @@ grant_type=authorization_code
 &code=XXXX
 ```
 
-Keycloak 回傳：
+`client_secret` 是客戶事先給你的暗號，Keycloak 用它確認這個請求是合法的 client。  
+這整段都在後端執行，瀏覽器完全不知道，`client_secret` 不會暴露出去。
+
+Keycloak 確認後回傳：
 
 ```json
 {
@@ -179,31 +192,45 @@ Keycloak 回傳：
 |------|------|
 | `id_token` | 使用者身份資訊（name、email、sub），JWT 格式 |
 | `access_token` | 授權資訊（`realm_access.roles`），JWT 格式 |
-| `refresh_token` | 用於在 access_token 過期前靜默換新 |
+| `refresh_token` | access_token 快過期時用來靜默換新，不用讓使用者重新登入 |
 
 ---
 
-### 段落四：驗簽 + 解析使用者資訊
+### 段落四：驗簽，確認 token 是真的 Keycloak 給的
 
-後端從 Keycloak `/certs` 取得 RSA 公鑰（JWKS），驗證 `id_token` 的 JWT 簽章合法性，  
-確認 token 確實由 Keycloak 簽發、未被竄改，才繼續解析：
+拿到的 token 不是普通 JSON，是 JWT 格式（三段用 `.` 分隔）：
 
 ```
-id_token  payload → sub / name / email（使用者身份）
-access_token payload → realm_access.roles（使用者角色）
+eyJhbGc...   .   eyJzdWIi...   .   SflKxwR...
+  header     .     payload     .    signature
 ```
 
-> `roles` 在 `access_token` 裡，不在 `id_token` 裡，需分開解析。
+payload Base64 解碼後就是使用者資訊，但你不能直接信任它——任何人都可以自己偽造一個 JWT 塞假資料進去。
+
+所以你要去 call Keycloak 的 `/certs` API 拿 RSA 公鑰，  
+用這把公鑰驗 JWT 第三段的 signature，確認這個 token 真的是 Keycloak 簽的、沒有被竄改。
+
+驗過之後才信任 payload，解析出：
+
+```
+id_token  payload → sub / name / email（使用者是誰）
+access_token payload → realm_access.roles（使用者能做什麼）
+```
+
+> roles 在 access_token，不在 id_token，要分開解析。  
+> RSA 公鑰會快取 1 小時，不是每次都打 Keycloak。
 
 ---
 
-### 段落五：建立 Session，導回前端
+### 段落五：存進 Redis，導回前端
 
-後端將完整 session（tokens + user info）存入 Redis（TTL 30 分鐘），  
+驗簽完成，後端把 user info + tokens 一起存進 Redis（session_id 為 key，TTL 30 分鐘），  
 再把瀏覽器 302 導向前端 `/dashboard`。
 
-前端載入後呼叫 `/api/auth/me`，後端從 Redis 讀出 session 回傳使用者資訊，  
-前端依 `roles` 判斷是否顯示管理員區塊。
+前端載入後打 `GET /api/auth/me`，後端從 cookie 拿 session_id，去 Redis 撈資料回傳。  
+前端拿到 user info 後依 roles 判斷要不要顯示管理員區塊。
+
+> `/api/auth/me` 只負責讀，不寫任何資料。之後每次重整頁面，前端都會打一次它確認登入狀態還在。
 
 ---
 
@@ -361,15 +388,54 @@ npm run dev
 
 ## API
 
-| Method | 路徑 | 說明 | 保護 |
-|--------|------|------|------|
-| `GET` | `/api/auth/login` | 產生 state，redirect 到 Keycloak 登入頁 | — |
-| `GET` | `/api/auth/callback` | 接收 code，換 token，建立 session，redirect 前端 | — |
-| `GET` | `/api/auth/logout` | 清除 session，redirect Keycloak 全域登出 | — |
-| `GET` | `/api/auth/me` | 回傳目前登入的使用者資訊 | session |
-| `GET` | `/api/admin/data` | 管理員專屬資料 | session + admin role |
+| Method | 路徑 | 保護 |
+|--------|------|------|
+| `GET` | `/api/auth/login` | — |
+| `GET` | `/api/auth/callback` | — |
+| `GET` | `/api/auth/logout` | — |
+| `GET` | `/api/auth/me` | session |
+| `GET` | `/api/admin/data` | session + admin role |
 
-**`/api/auth/me` 回傳範例**
+---
+
+### GET /api/auth/login
+
+**觸發時機**：使用者點「SSO 登入」按鈕  
+**後端做什麼**：產生 state + session_id → 存 Redis → 組 Keycloak auth URL → 302 redirect  
+**使用者看到**：畫面直接跳到 Keycloak 登入頁，這支 API 本身不顯示任何東西
+
+---
+
+### GET /api/auth/callback
+
+**觸發時機**：使用者在 Keycloak 登入成功後，由 Keycloak 透過瀏覽器 302 自動觸發  
+**後端做什麼**：
+1. 從 Redis 讀 state，與 URL 上的 state 比對
+2. POST /token 給 Keycloak，用 code + client_secret 換 token
+3. GET /certs 拿公鑰，驗 id_token 的 JWT 簽章
+4. 解析 id_token 取 name / email / sub，解析 access_token 取 roles
+5. 把完整 session 存進 Redis（TTL 30 分鐘）
+6. 302 redirect 前端 /dashboard
+
+**使用者看到**：這支 API 也不顯示任何東西，瀏覽器直接被導向前端
+
+---
+
+### GET /api/auth/logout
+
+**觸發時機**：使用者點「登出」按鈕  
+**後端做什麼**：清除 Redis session → 清除 cookie → redirect Keycloak 登出 URL  
+**使用者看到**：Keycloak 完成全域登出後，被導回前端首頁
+
+> 若只清 session 不通知 Keycloak，使用者在其他串接系統仍保持登入，無法達到 SSO 全域登出。
+
+---
+
+### GET /api/auth/me
+
+**觸發時機**：前端每次進入 /dashboard 或重整頁面  
+**後端做什麼**：從 cookie 拿 session_id → 去 Redis 撈 user info → 回傳 JSON  
+**注意**：只負責讀，不寫任何資料。登入狀態存在 Redis，這支 API 只是讀出來給前端用
 
 ```json
 {
@@ -380,6 +446,14 @@ npm run dev
   "roles": ["offline_access", "admin", "default-roles-demo", "uma_authorization"]
 }
 ```
+
+---
+
+### GET /api/admin/data
+
+**觸發時機**：前端點「呼叫管理員 API」  
+**保護**：RequireRole middleware 檢查 session 的 roles 是否包含 admin 或 advanced（大小寫不限），沒有直接回 403  
+**後端做什麼**：通過驗證後回傳管理員專屬資料
 
 ---
 
