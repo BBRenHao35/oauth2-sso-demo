@@ -32,7 +32,39 @@ Go Backend / Gin (localhost:8081)
 
 ## 登入流程
 
-### 整體 Sequence Diagram
+### 簡易版：系統邊界與主要互動
+
+```mermaid
+graph LR
+    U([使用者])
+
+    subgraph dev [開發方]
+        F[Vue3 前端]
+        B[Go 後端]
+        R[(Redis)]
+    end
+
+    subgraph kc [客戶端 - Keycloak Server]
+        K[Keycloak]
+    end
+
+    U -->|點擊登入| F
+    F -->|redirect| B
+    B <-->|session 存取| R
+    B -->|① 導向 Keycloak 登入頁| K
+    K -->|② callback + code| B
+    B -->|③ 用 code 換 token| K
+    K -->|④ 回傳 token| B
+    B -->|⑤ JWKS 驗簽取公鑰| K
+    B -->|登入完成 redirect| F
+    F -->|顯示 Dashboard| U
+```
+
+> 實務上，你負責開發方（Frontend + Backend），客戶只需提供 Keycloak Server 的 URL 與憑證（Client ID / Secret）。換掉 `.env` 即可對接正式環境。
+
+---
+
+### 細部版：完整 Sequence Diagram
 
 ```mermaid
 sequenceDiagram
